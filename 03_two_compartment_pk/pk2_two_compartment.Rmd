@@ -1,0 +1,846 @@
+---
+title: "PK2: Two-Compartment Oral PK — Parameter Sensitivity Exploration"
+author: "Ruoqi Deng"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: readable
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi = 100
+)
+```
+
+# Background and goals
+
+The previous project in this portfolio (`02_pk1_oral_one_compartment/`) worked
+with the simplest pharmacologically meaningful structure: a one-compartment
+model with first-order oral absorption and first-order elimination. By
+perturbing `KA`, `CL`, and `V` one at a time, that project built intuition for
+how each parameter reshapes the concentration-time curve, and surfaced one
+counterintuitive result (doubling `V` raised the amount in the
+central compartment while lowering plasma concentration).
+
+This project adds one structural element: a **peripheral compartment**. The
+drug now has somewhere else to go besides being cleared. That single addition
+introduces two new parameters and one qualitatively new phenomenon.
+
+The model is `pk2` from `mrgsolve`'s built-in model library. Relative to `pk1`
+it adds:
+
+- `PERIPH` — a peripheral compartment (mg) representing tissues whose drug
+  concentration lags behind plasma.
+- `Q` — inter-compartmental clearance (L/h), governing how fast drug exchanges
+  between central and peripheral compartments.
+- `V3` — peripheral volume of distribution (L).
+
+The parameters carried over from `pk1` keep almost the same names (`CL`, `KA`),
+with the one-compartment `V` now written `V2` for the central volume. This
+continuity is deliberate: setting `Q` to zero should recover `pk1` exactly, and
+one of the experiments below tests precisely that.
+
+The qualitatively new phenomenon is the **distribution phase**: an initial
+rapid decline after the peak, followed by a slower terminal decline, visible as
+a change in slope ("kink") on a semi-log plot of `CP` versus time.
+
+## What this document does
+
+Six experiments, organized as two groups. The first four isolate the two new
+parameters (`Q` and `V3`) and the structural behavior they produce. The last
+two are control experiments that confirm the basic properties established in
+`pk1` survive the move to two compartments.
+
+1. **Baseline simulation** — single 100 mg dose, 72 h horizon.
+2. **Experiment 1: Double `Q`** — faster inter-compartmental exchange.
+3. **Experiment 2: Double `V3`** — larger peripheral compartment.
+   *My prediction for this one was wrong, and working out why is where most of
+   the value of this project sits.*
+4. **Experiment 3: `Q` toward 0** — does `pk2` degenerate to `pk1`?
+5. **Experiment 4: `Q` toward infinity** — the rapid-equilibrium limit.
+6. **Experiment 5: Double the dose** — dose-proportional scaling.
+7. **Experiment 6: Multiple dosing (Q12h x 5)** — accumulation, and a
+   comparison against the one-compartment case.
+
+# Model
+
+## Equations
+
+The two-compartment oral model is governed by three ODEs:
+
+$$
+\begin{aligned}
+\frac{dA_{EV}}{dt}     &= -K_A \cdot A_{EV} \\
+\frac{dA_{CENT}}{dt}   &=  K_A \cdot A_{EV}
+                          - \frac{CL}{V_2} \cdot A_{CENT}
+                          - \frac{Q}{V_2} \cdot A_{CENT}
+                          + \frac{Q}{V_3} \cdot A_{PERIPH} \\
+\frac{dA_{PERIPH}}{dt} &=  \frac{Q}{V_2} \cdot A_{CENT}
+                          - \frac{Q}{V_3} \cdot A_{PERIPH}
+\end{aligned}
+$$
+
+with plasma concentration
+
+$$
+CP(t) = \frac{A_{CENT}(t)}{V_2}.
+$$
+
+The four terms in the central-compartment equation are, in order: absorption
+from the depot, elimination by clearance, transfer out to the peripheral
+compartment, and return from the peripheral compartment. The structure is
+
+$$
+EV \xrightarrow{K_A} CENT \underset{Q/V_3}{\overset{Q/V_2}{\rightleftharpoons}} PERIPH,
+\qquad CENT \xrightarrow{CL/V_2} \text{(cleared)}.
+$$
+
+Two points worth noting before any simulation, because they explain most of
+what follows:
+
+- `V3` never appears in the definition of `CP`. Its only entry into the system
+  is through the combination `Q/V3` in the exchange terms. Any effect of `V3`
+  on plasma concentration is therefore entirely indirect, routed through the
+  peripheral compartment.
+- `Q` and `V3` always appear as the ratios `Q/V2` and `Q/V3`, which are rate
+  constants (1/h). The same flow `Q` produces a faster turnover in the smaller
+  compartment.
+
+## Setup
+
+```{r libraries}
+library(mrgsolve)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+Load the built-in `pk2` model:
+
+```{r load-model}
+mod <- modlib("pk2")
+mod
+```
+
+Check default parameter values:
+
+```{r default-params}
+param(mod)
+```
+
+Defaults: `CL = 1`, `V2 = 20`, `Q = 2`, `V3 = 10`, `KA = 1`. Note that `CL`,
+`V2`, and `KA` match the `pk1` defaults exactly, which is what makes the
+`Q -> 0` degeneration test in Experiment 3 a clean comparison.
+
+Helper functions used throughout:
+
+```{r helpers}
+# Run a single-dose simulation under a given parameter set, return a tidy frame
+run_single_dose <- function(model, dose = 100, end = 72, delta = 0.1) {
+  model %>%
+    ev(amt = dose) %>%
+    mrgsim(end = end, delta = delta) %>%
+    as.data.frame()
+}
+
+# Tag each simulation with a label, for overlay plotting
+label_run <- function(df, label) {
+  df %>% mutate(scenario = label)
+}
+
+# Estimate terminal half-life by log-linear regression on the tail
+terminal_thalf <- function(df, t_min = 40) {
+  d <- df %>% filter(time >= t_min, CP > 0)
+  fit <- lm(log(CP) ~ time, data = d)
+  lambda <- -coef(fit)[["time"]]
+  log(2) / lambda
+}
+
+# AUC by linear trapezoidal rule (to Clast)
+auc_trap <- function(df) {
+  d <- df %>% filter(CP > 0)
+  sum(diff(d$time) * (head(d$CP, -1) + tail(d$CP, -1)) / 2)
+}
+```
+
+# Baseline simulation
+
+A single 100 mg oral dose, simulated over 72 hours.
+
+```{r baseline-sim}
+out_baseline <- run_single_dose(mod, dose = 100)
+head(out_baseline)
+```
+
+```{r baseline-plot-linear, fig.cap="Figure 1. Baseline single-dose simulation, linear scale."}
+ggplot(out_baseline, aes(x = time, y = CP)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Baseline plasma concentration (linear scale)",
+    x = "Time (h)", y = "CP (mg/L)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r baseline-plot-log, fig.cap="Figure 2. Baseline single-dose simulation, semi-log scale. The change in slope around 10 h marks the transition from distribution phase to elimination phase."}
+out_baseline %>%
+  filter(CP > 0) %>%
+  ggplot(aes(x = time, y = CP)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Baseline plasma concentration (semi-log scale)",
+    x = "Time (h)", y = "CP (mg/L), log scale"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The concentration-time profile divides cleanly into three
+phases. During the absorption phase (0 to ~3 h), drug transfers from the
+extravascular depot into the central compartment at rate KA, and CP rises
+steeply as absorption dominates both elimination and distribution. During the
+distribution phase (~3 to ~10 h), drug flows out of the central compartment
+into the peripheral compartment faster than it returns; this net transfer to
+the periphery produces a rapid decline in CP. During the elimination phase
+(after ~10 h), the central and peripheral compartments approach
+quasi-equilibrium: drug still exchanges between them, but the net
+inter-compartmental flow is small compared to the rate at which CL removes
+drug from the system, so the entire system declines together, producing a
+single straight line on the semi-log scale.
+
+On the linear scale, the curve looks almost indistinguishable from the
+one-compartment profile produced by pk1. Only on the semi-log scale does the
+slope change around 10 h become visible. I can see why semi-log plots are
+the standard first tool for identifying multi-compartment kinetics in
+pharmacometric practice.
+
+To make the distribution phase directly visible, rather than inferring it from
+the slope of the CP curve, the next plot overlays the drug amounts in the
+central and peripheral compartments.
+
+```{r baseline-compartments, fig.cap="Figure 3. Amounts in the central and peripheral compartments. The peripheral compartment fills with a lag, then declines in parallel with central once quasi-equilibrium is reached."}
+out_baseline %>%
+  select(time, CENT, PERIPH) %>%
+  pivot_longer(cols = c(CENT, PERIPH),
+               names_to = "compartment", values_to = "amount") %>%
+  ggplot(aes(x = time, y = amount, color = compartment)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Drug amount by compartment",
+    x = "Time (h)", y = "Amount (mg)", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The peripheral compartment fills with a clear lag behind the
+central compartment, then the two amounts converge toward quasi-equilibrium,
+after which they decline together. The moment that quasi-equilibrium is
+established corresponds to the change in slope seen around 10 h in Figure 2.
+
+
+# Single-parameter perturbations
+
+For each experiment, the perturbed curve is overlaid on the baseline so the
+shift can be read directly. Semi-log scale is used wherever the distribution
+phase is the point of interest, since the change in slope is only legible
+there.
+
+## Experiment 1: Double `Q` (faster inter-compartmental exchange)
+
+```{r exp1-q}
+out_q <- mod %>% param(Q = 4) %>% run_single_dose(dose = 100)
+
+sim_exp1 <- bind_rows(
+  label_run(out_baseline, "Baseline (Q = 2)"),
+  label_run(out_q,        "Q doubled (Q = 4)")
+)
+```
+
+```{r exp1-plot, fig.cap="Figure 4. Doubling Q on semi-log scale."}
+sim_exp1 %>%
+  filter(CP > 0) %>%
+  ggplot(aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Experiment 1: Effect of doubling Q",
+    x = "Time (h)", y = "CP (mg/L), log scale", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The Q = 4 curve sits only slightly below baseline at the peak:
+Cmax drops by a small amount, while Tmax is virtually unchanged. This is
+expected because the peak occurs early (~2-3 h), when the peripheral
+compartment is still nearly empty. Both Q-dependent terms in the
+central-compartment equation scale with A_PERIPH, which is close to zero at
+that point, so doubling Q has little leverage on Cmax.
+
+The more visible effect is on the distribution phase. On the semi-log plot,
+the transition from the steep initial decline to the shallower terminal
+decline occurs noticeably earlier with Q = 4 than at baseline. A larger Q
+accelerates inter-compartmental exchange, so the system reaches
+quasi-equilibrium sooner and the distribution phase compresses in time.
+
+The terminal slope is very similar between the two curves after roughly 20 h.
+A useful approximation is that, once the two compartments approach
+quasi-equilibrium, the late phase behaves like a single well-mixed pool with
+an effective volume close to V2 + V3. Because V2 + V3 is unchanged here, the
+terminal half-life changes only slightly. Strictly, the terminal slope
+in a two-compartment model is a hybrid eigenvalue and can still depend on Q.
+
+
+## Experiment 2: Double `V3` (larger peripheral compartment)
+
+This is the experiment where my prediction turned out to be wrong, and tracing
+the reason is the most useful thing I got out of this project.
+
+```{r exp2-v3}
+out_v3 <- mod %>% param(V3 = 20) %>% run_single_dose(dose = 100)
+
+sim_exp2 <- bind_rows(
+  label_run(out_baseline, "Baseline (V3 = 10)"),
+  label_run(out_v3,       "V3 doubled (V3 = 20)")
+)
+```
+
+### What I expected vs. what the simulation showed
+
+I expected that doubling V3 would lower CP across the entire post-Cmax curve:
+a larger peripheral compartment would simply absorb more drug from the central
+compartment, pulling CP down at all times after the peak. The simulation
+proved this half-right. Concentrations were indeed lower during the
+distribution phase, but the two curves crossed at around 45 h, after which
+the V3-doubled scenario showed *higher* CP than baseline and declined more
+slowly through the terminal phase.
+
+```{r exp2-plot, fig.cap="Figure 5. Doubling V3 on semi-log scale. The two curves cross: V3 doubled sits below baseline early, then above it later."}
+sim_exp2 %>%
+  filter(CP > 0) %>%
+  ggplot(aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Experiment 2: Effect of doubling V3",
+    x = "Time (h)", y = "CP (mg/L), log scale", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Why one parameter moves CP in opposite directions
+
+**What I see:** V3 enters the ODE system only through the inter-compartmental
+return term (Q/V3) · A_PERIPH. It does not appear in the definition
+CP = A_CENT / V2. Therefore, its influence on plasma concentration is entirely
+indirect, mediated through drug redistribution. Doubling V3 halves Q/V3,
+which slows the return of drug from the peripheral compartment to the central
+compartment. This single kinetic change has opposite consequences depending
+on which phase of the profile dominates.
+
+During the distribution phase, the net flow is from central to peripheral
+compartment. Slowing the return flux reduces the compensating back-flow,
+increasing the net outward transfer. The result is that more drug is retained
+in the periphery and CP falls further below baseline.
+
+During the terminal phase, the two compartments have reached
+quasi-equilibrium and the system behaves approximately as a single pool with
+effective volume V2 + V3. The peripheral compartment is now a reservoir, and
+the return flux from peripheral to central is the dominant source of drug
+sustaining plasma concentration. Slowing that return releases drug more
+gradually, extending the effective volume from 30 L to 40 L and prolonging
+the terminal half-life. CP therefore declines more slowly and eventually
+crosses above baseline.
+
+These are not two separate effects but two faces of one mechanism, the
+slowed Q/V3 return, operating on different time scales. The crossover point
+(~45 h) is where the benefit of prolonged release overtakes the cost of
+early sequestration.
+
+### Terminal half-life check
+
+A log-linear fit to the terminal segment confirms the late-phase behavior:
+
+```{r exp2-thalf}
+data.frame(
+  scenario = c("Baseline (V3 = 10)", "V3 doubled (V3 = 20)"),
+  terminal_half_life_h = c(
+    terminal_thalf(out_baseline),
+    terminal_thalf(out_v3)
+  ),
+  approx_half_life_h = log(2) * c(30, 40) / 1
+)
+```
+
+The estimated terminal half-life increases from ~22 h to ~32 h after doubling
+V3, confirming that a larger peripheral compartment prolongs the terminal
+phase. The simple approximation $t_{1/2} \approx \ln 2 \cdot (V_2 + V_3) / CL$
+predicts 20.8 h and 27.7 h, which underestimates in both cases. The gap is
+larger for V3 = 20 (~4 h difference). I suspect this is because the
+approximation assumes rapid equilibrium between compartments ($Q \gg CL$),
+and with $Q/CL = 2$ that assumption may not hold well enough. The log-linear
+regression, which makes no such assumption, is likely the more trustworthy
+estimate here.
+
+### AUC conservation check
+
+Changing V3 should not alter AUC₀₋∞: total exposure is governed by
+$\text{AUC} = F \cdot \text{Dose} / CL$, and neither F, Dose, nor CL changed.
+
+The trapezoidal AUC computed below is AUC to the end of the simulation window,
+not a true AUC₀₋∞. Therefore, small differences can appear when V3 changes the
+terminal tail. AUC₀₋∞ would be expected to remain Dose/CL in this linear model.
+
+```{r exp2-auc}
+data.frame(
+  scenario = c("Baseline (V3 = 10)", "V3 doubled (V3 = 20)"),
+  AUC = c(auc_trap(out_baseline), auc_trap(out_v3))
+)
+```
+
+Both AUC values should be equal (Dose/CL = 100 for 100% bioavailability).
+The trapezoidal estimates may differ slightly because the simulation window
+(72 h) truncates a longer tail in the V3-doubled case. This confirms that
+V3 redistributes exposure across time without changing the total: the drug
+is paid out over a longer period, not added or subtracted.
+
+### Note on Cmax insensitivity
+
+Although V3 substantially altered the later concentration profile, its effect
+on Cmax was minimal. Around Tmax, little drug has yet accumulated in the
+peripheral compartment, so the return flux (Q/V3) · A_PERIPH remains small
+regardless of V3. The influence of V3 emerges only later, as peripheral drug
+accumulation increases and redistribution becomes the dominant process.
+
+
+## Experiment 3: `Q` toward 0 (does pk2 degenerate to pk1?)
+
+If the peripheral compartment is the only thing separating `pk2` from `pk1`,
+then shutting off the exchange (`Q -> 0`) should make `pk2` behave exactly like
+`pk1`. This experiment tests that, and the test is quantitative, not visual.
+
+```{r exp3-q0}
+# pk1 for comparison
+mod_pk1 <- modlib("pk1")
+out_pk1  <- run_single_dose(mod_pk1, dose = 100)
+
+# pk2 with Q -> 0
+out_q0 <- mod %>% param(Q = 0.001) %>% run_single_dose(dose = 100)
+
+sim_exp3 <- bind_rows(
+  label_run(out_baseline, "pk2 baseline (Q = 2)"),
+  label_run(out_q0,       "pk2 with Q -> 0 (Q = 0.001)"),
+  label_run(out_pk1,      "pk1 baseline (1-compartment)")
+)
+```
+
+```{r exp3-plot, fig.cap="Figure 6. pk2 with Q -> 0 overlaid on pk1. The pk1 curve is not missing; it is hidden underneath the pk2 Q -> 0 curve."}
+ggplot(sim_exp3, aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Experiment 3: Q -> 0 degeneration to pk1",
+    x = "Time (h)", y = "CP (mg/L)", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+The two curves appear to overlap so completely that only two lines are visible
+where three were plotted. Rather than trust the eye, quantify the residual
+between `pk2 (Q -> 0)` and `pk1`:
+
+```{r exp3-residual}
+compare <- out_q0 %>%
+  select(time, CP_q0 = CP) %>%
+  left_join(out_pk1 %>% select(time, CP_pk1 = CP), by = "time") %>%
+  mutate(diff = CP_q0 - CP_pk1)
+
+summary(compare$diff)
+max(abs(compare$diff))
+```
+
+**What I see:** The residuals are uniformly negative and extremely small,
+indicating that CP under pk2 with Q = 0.001 is only fractionally lower than
+under pk1. The negative sign is expected: even Q = 0.001 allows a trickle of
+drug to transfer into the peripheral compartment, reducing the central amount
+by a negligible amount. Strict equivalence requires Q = 0 exactly, but the
+residual at Q = 0.001 is well below any measurable precision, confirming
+the structural degeneration.
+
+This degeneration is also visible directly in the ODE: as `Q -> 0`, both
+`Q`-dependent terms in the central-compartment equation vanish, leaving
+
+$$
+\frac{dA_{CENT}}{dt} = K_A \cdot A_{EV} - \frac{CL}{V_2} \cdot A_{CENT},
+$$
+
+which is exactly the `pk1` central-compartment equation (with `V2 = V`). The
+peripheral compartment receives nothing and stays empty. So the overlap is not
+a coincidence; it is structurally guaranteed whenever the carried-over
+parameters match.
+
+
+## Experiment 4: `Q` toward infinity (rapid-equilibrium limit)
+
+The opposite extreme. If `Q` is very large, the two compartments equilibrate
+almost instantly, and the system should behave like a single compartment with
+the combined volume `V2 + V3`.
+
+```{r exp4-qinf}
+out_qinf <- mod %>% param(Q = 100) %>% run_single_dose(dose = 100)
+
+sim_exp4 <- bind_rows(
+  label_run(out_baseline, "Baseline (Q = 2)"),
+  label_run(out_qinf,     "Q -> inf (Q = 100)")
+)
+```
+
+```{r exp4-plot, fig.cap="Figure 7. Q -> infinity on semi-log scale. The distribution-phase kink disappears; the terminal slope matches baseline."}
+sim_exp4 %>%
+  filter(CP > 0) %>%
+  ggplot(aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Experiment 4: Effect of Q -> infinity",
+    x = "Time (h)", y = "CP (mg/L), log scale", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** Compared with the baseline, Cmax under rapid equilibrium is
+lower and Tmax is slightly delayed. Rapid inter-compartmental exchange causes
+drug to distribute almost immediately throughout the combined volume V2 + V3,
+reducing the concentration observed in the central compartment alone.
+
+The distribution-phase kink disappears entirely. Because equilibration
+between compartments occurs on a time scale much faster than either
+absorption or elimination, the distribution phase collapses into an
+imperceptibly short interval. The plasma concentration enters a single
+log-linear decline immediately after Cmax.
+
+Despite the dramatically different early behavior, both scenarios ultimately
+converge to the same terminal slope: once the baseline curve also reaches
+quasi-equilibrium, both systems behave as a single well-mixed pool with
+effective volume V2 + V3. Q mainly determines how fast the system reaches
+the terminal phase. In the rapid-equilibrium approximation, the terminal
+phase is governed mostly by the effective volume and clearance, although the
+exact hybrid terminal slope can still change slightly with Q.
+
+Putting both extremes of `Q` on one plot shows the full picture: `Q` is a slider
+between a fully separated two-compartment system and a single well-mixed volume.
+
+```{r q-slider, fig.cap="Figure 8. Q as a slider. Q -> 0 recovers the one-compartment limit (effective volume V2); Q -> infinity gives instantaneous equilibrium (effective volume V2 + V3). Both extremes erase the kink, for opposite reasons."}
+sim_q_slider <- bind_rows(
+  label_run(out_q0,       "Q -> 0 (1-cmt limit, vol = V2)"),
+  label_run(out_baseline, "Q = 2 (baseline)"),
+  label_run(out_qinf,     "Q -> inf (rapid equilib, vol = V2+V3)")
+)
+
+sim_q_slider %>%
+  filter(CP > 0) %>%
+  ggplot(aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_log10() +
+  labs(
+    title = "Q as a slider between two single-compartment limits",
+    x = "Time (h)", y = "CP (mg/L), log scale", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The two limiting cases both erase the distribution-phase kink,
+but for opposite reasons. As Q approaches zero, the distribution mode
+vanishes because the peripheral compartment is kinetically isolated; drug
+remains in the central compartment, and the effective volume is V2 alone. As
+Q approaches infinity, the distribution phase occurs almost instantaneously;
+drug spreads across both compartments before any measurable time elapses, and
+the effective volume is V2 + V3. Only at intermediate values of Q does the
+kink appear, because only then is the distribution time scale slow enough to
+observe but fast enough to matter.
+
+## Experiment 5: Double the dose (dose-proportional scaling)
+
+```{r exp5-dose}
+out_dose200 <- run_single_dose(mod, dose = 200)
+
+sim_exp5 <- bind_rows(
+  label_run(out_baseline,  "Dose = 100 mg"),
+  label_run(out_dose200,   "Dose = 200 mg")
+)
+```
+
+```{r exp5-plot, fig.cap="Figure 9. Doubling the dose scales the entire curve by a factor of two; shape, Tmax, and terminal slope are unchanged."}
+ggplot(sim_exp5, aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Experiment 5: Effect of doubling dose",
+    x = "Time (h)", y = "CP (mg/L)", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+A numeric check that the scaling is exactly proportional:
+
+```{r exp5-ratio}
+ratio_check <- out_dose200 %>%
+  select(time, CP_200 = CP) %>%
+  left_join(out_baseline %>% select(time, CP_100 = CP), by = "time") %>%
+  filter(CP_100 > 0.01) %>%
+  mutate(ratio = CP_200 / CP_100)
+
+summary(ratio_check$ratio)
+```
+
+**What I see:** The ratio of the 200 mg to 100 mg concentration is exactly 2.0
+at every time point. This confirms dose-proportional scaling: CL, Q, V2, and
+V3 are all constants (not concentration-dependent), so all elimination and
+distribution processes are first-order. Doubling the input doubles every
+output. The two-compartment structure does not change the linearity
+established in pk1. Exposure is dose-proportional; dose changes the scale of
+the concentration profile but not the kinetic rate constants governing its
+shape.
+
+## Experiment 6: Multiple dosing (Q12h × 5)
+
+The final experiment repeats the multiple-dose regimen from `pk1`, this time
+comparing the one- and two-compartment models directly.
+
+```{r exp6-sim}
+mod_pk1 <- modlib("pk1")
+mod_pk2 <- mod
+
+out_multi_pk1 <- mod_pk1 %>%
+  ev(amt = 100, ii = 12, addl = 4) %>%
+  mrgsim(end = 96, delta = 0.1) %>%
+  as.data.frame()
+
+out_multi_pk2 <- mod_pk2 %>%
+  ev(amt = 100, ii = 12, addl = 4) %>%
+  mrgsim(end = 96, delta = 0.1) %>%
+  as.data.frame()
+
+sim_exp6 <- bind_rows(
+  out_multi_pk1 %>% mutate(model = "pk1"),
+  out_multi_pk2 %>% mutate(model = "pk2")
+)
+```
+
+```{r exp6-plot, fig.cap="Figure 10. Multiple dosing comparison between pk1 and pk2 under 100 mg Q12h x 5."}
+ggplot(sim_exp6, aes(x = time, y = CP, color = model)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Experiment 6: Multiple dosing comparison",
+    x = "Time (h)",
+    y = "CP (mg/L)",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Cmax / Cmin at steady state
+
+```{r exp6-summary}
+last_dose_time <- 48
+tau <- 12
+
+sim_exp6 %>%
+  filter(time >= last_dose_time, time <= last_dose_time + tau) %>%
+  group_by(model) %>%
+  summarise(
+    Cmax = max(CP),
+    Cmin = min(CP),
+    .groups = "drop"
+  )
+```
+
+### Fluctuation
+
+```{r exp6-fluctuation}
+last_dose_time <- 48
+tau <- 12
+
+sim_exp6 %>%
+  filter(time >= last_dose_time, time <= last_dose_time + tau) %>%
+  group_by(model) %>%
+  summarise(
+    fluctuation = max(CP) - min(CP),
+    ratio = max(CP) / min(CP),
+    .groups = "drop"
+  )
+```
+The summary was calculated over the last dosing interval from 48 to 60 h,
+rather than over the entire post-dose tail. This avoids treating the washout
+phase as part of the steady-state trough calculation.
+
+**What I see:** Compared with pk1, pk2 exhibits slightly smaller
+peak-to-trough fluctuation within each dosing interval. Distribution into the
+peripheral compartment siphons drug away from the central compartment after
+each dose, reducing peak concentrations. The peripheral compartment also
+slows the decline between doses by releasing drug back, but under the
+baseline parameter set this effect is not large enough to raise troughs above
+pk1. Overall, the concentration profile is modestly dampened: lower peaks,
+similar troughs, and narrower swings. I can see how this dampening would
+matter clinically: for drugs with narrow therapeutic windows, the peripheral
+compartment could reduce the risk of transient supra-therapeutic peaks after
+each dose.
+
+
+# Summary: parameter influence matrix
+
+A condensed reference for what each parameter controls in this model.
+
+```{r summary-table, echo=FALSE}
+summary_tbl <- data.frame(
+  Parameter = c("KA", "CL", "V2", "Q", "V3", "Dose"),
+  `Absorption / Cmax` = c(
+    "Higher Cmax, earlier Tmax",
+    "Lower Cmax",
+    "Lower Cmax",
+    "Almost no effect on Cmax",
+    "Almost no effect on Cmax",
+    "Proportionally higher"
+  ),
+  `Distribution phase` = c(
+    "Unchanged",
+    "Unchanged",
+    "Unchanged",
+    "Faster equilibration, kink sharper/earlier",
+    "Deeper distribution (more drug withheld)",
+    "Unchanged shape"
+  ),
+  `Terminal half-life` = c(
+    "Unchanged",
+    "Shorter",
+    "Longer",
+    "Minimal change when V2+V3 fixed",
+    "Longer (V2+V3 larger)",
+    "Unchanged"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(
+  summary_tbl,
+  caption = "Table 1. How each parameter shifts the canonical features of the CP curve."
+)
+```
+
+A few patterns worth noting. Distribution-related parameters (Q and V3) have
+limited influence on Cmax. Because peak concentration occurs before
+substantial drug accumulation in the peripheral compartment, these parameters
+have much smaller effects on Cmax than parameters governing absorption,
+clearance, or central volume.
+
+Q and V3 play fundamentally different roles. Q is a rate parameter: it
+governs how quickly the system approaches quasi-equilibrium without
+substantially altering where that equilibrium sits. V3 is a capacity
+parameter: it determines how much drug can be stored peripherally and
+therefore sets the effective distribution volume at later times.
+
+A single parameter can produce opposite effects at different stages of the
+profile. Increasing V3 lowers CP during distribution (more peripheral
+sequestration) but raises CP during the terminal phase (larger effective
+volume, longer half-life). This underscores a general principle: parameter
+influence should be interpreted through the equations in which a parameter
+appears, not the compartment label it carries.
+
+The conceptual jump from one to two compartments:
+
+```{r jump-table, echo=FALSE}
+jump_tbl <- data.frame(
+  Aspect = c(
+    "Compartments",
+    "Decline phases (semi-log)",
+    "Effective volume",
+    "New parameters",
+    "Terminal half-life driver"
+  ),
+  pk1 = c(
+    "1 (central only)",
+    "1 (single straight line)",
+    "V",
+    "—",
+    "V / CL"
+  ),
+  pk2 = c(
+    "2 (central + peripheral)",
+    "2 (distribution + elimination, with a kink)",
+    "V2 + V3 at quasi-equilibrium",
+    "Q (rate), V3 (capacity)",
+    "ln 2 * (V2 + V3) / CL (approx.)"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(
+  jump_tbl,
+  caption = "Table 2. What pk2 adds relative to pk1."
+)
+```
+
+The semi-log plot reveals two distinct decline phases, which is the hallmark
+of a two-compartment system: each kinetically distinguishable compartment
+contributes its own exponential term to the overall profile.
+
+## Clinical relevance
+
+Working through these experiments, I can see how two-compartment kinetics
+would matter for practical dosing decisions. The rapid post-peak drop during
+the distribution phase seems directly relevant to loading-dose design, and
+the dampened peak-to-trough fluctuation in Experiment 6 suggests that
+ignoring distribution could lead to overly conservative dosing intervals.
+These are connections I want to explore more concretely as I move toward
+published clinical PK models in the next project.
+
+
+# Reflection
+
+The experiment that taught me the most was the V3 sensitivity analysis. I
+predicted that doubling the peripheral volume would lower plasma
+concentrations across the entire post-Cmax curve. The simulation proved this
+half-right: concentrations fell during the distribution phase but crossed
+above baseline around 45 h and remained higher through the terminal phase.
+A similar moment occurred in pk1 when the V experiment contradicted my
+initial prediction. In both cases, the failed prediction was more instructive
+than a confirmed one, because it forced me back to the equations.
+
+The mechanism, traced in detail in Experiment 2, reduces to a single kinetic
+change (halving the Q/V3 return rate) whose consequences reverse sign
+depending on which phase of the profile dominates. Before this project, I
+tended to interpret parameters by the compartment they belong to ("V3 is a
+peripheral parameter, so it affects peripheral behavior"). The V3 result
+taught me to trace where a parameter sits in the governing equations instead.
+
+**Engineering parallel:** This discipline is familiar from my PhD work in
+finite-element analysis of knee joint models built from statistical shape
+modeling. A single geometric parameter, such as femoral condyle curvature,
+could simultaneously affect cartilage contact area, peak contact pressure,
+and fluid pressurization, with its net effect depending on the loading phase.
+Intuition about what a "shape parameter" should do was frequently misleading;
+the only reliable approach was to trace it through the coupled governing
+equations. The V3 analysis was the same class of problem in a
+pharmacokinetic setting: a parameter whose influence is indirect,
+time-dependent, and counterintuitive unless followed through the mathematics.
+
+As these models grow toward full QSP systems with dozens of coupled states
+and feedback loops, I expect this equation-tracing discipline to become not
+just useful but necessary.
+
+# Next steps
+
+The next project (`04_pk3_published_model/`) steps away from built-in models
+and reproduces a published population PK model from the literature, with
+covariate effects and inter-individual variability. That is the form
+pharmacometric work actually takes in industry and regulatory practice: not
+exploring a textbook structure, but fitting and qualifying a model against real
+data and reported parameter estimates.
