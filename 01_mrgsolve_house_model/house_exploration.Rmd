@@ -1,0 +1,353 @@
+---
+title: "House Model: Exploring a Built-in PK/PD System with mrgsolve"
+author: "Ruoqi Deng"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: readable
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi = 100
+)
+```
+
+# Background and goals
+
+This document captures my first hands-on exploration of `mrgsolve`, starting
+from the package's built-in `house()` model. The goal is not to produce a
+publication-grade analysis, but to build operational familiarity with the core
+simulation workflow (model loading, event construction, multi-dose simulation,
+and visualization of coupled PK/PD output) using a model small enough to fully
+understand.
+
+My doctoral training was in computational biomechanics, where I built
+PDE-based mechanistic models, ran parameter sensitivity studies, and propagated
+population variability through coupled multi-physics systems. The simulation
+workflow in `mrgsolve` is structurally familiar: define a system of ODEs,
+specify inputs, integrate over time, examine outputs. What is new is the
+domain: drug concentration replaces tissue strain, dosing events replace
+mechanical loading, and PD endpoints replace contact mechanics. This project
+is the first step in re-grounding my modeling skills in pharmacology.
+
+## What `house()` is
+
+`house()` is an internal teaching model shipped with `mrgsolve`. It contains
+a one-compartment oral PK structure with an absorption depot (`GUT` → `CENT`),
+first-order absorption, linear elimination, and an indirect-response PD
+component (`RESP`). The model also includes a small set of covariate effects
+(body weight, sex) and inter-individual variability terms (a 4×4 OMEGA block).
+
+The model has three compartments:
+
+- `GUT`  — oral absorption depot (mg)
+- `CENT` — central compartment (mg)
+- `RESP` — pharmacodynamic response variable
+
+and two captured outputs of interest:
+
+- `CP`   — plasma concentration, computed from `CENT / VC`
+- `RESP` — PD response, indirectly driven by `CP`
+
+It is small enough to read through in full, yet structurally complete enough to
+illustrate the building blocks that recur in real-world pharmacometric and QSP
+models.
+
+## What this document does
+
+Two simulation experiments, layered:
+
+1. **Baseline simulation** — a single dose level (100 mg Q24h × 5) to observe
+   the four state variables (`GUT`, `CENT`, `CP`, `RESP`) over a one-week
+   window.
+2. **Dose-response exploration** — four dose levels (50, 100, 200, 400 mg) on
+   the same regimen, plotted separately for PK and PD to expose the
+   nonlinearity introduced by the IC50-driven response.
+
+# Setup
+
+```{r libraries}
+library(mrgsolve)
+library(dplyr)
+library(ggplot2)
+```
+
+Load the model:
+
+```{r load-model}
+mod <- house()
+mod
+```
+
+The summary printout shows the model's compartments, parameters, and capture
+variables. The two captured outputs of interest are `CP` (plasma
+concentration, computed from `CENT / VC`) and `RESP` (PD response variable,
+indirectly driven by `CP`).
+
+# Experiment 1: Baseline multi-dose simulation
+
+## Regimen
+
+A standard repeated oral dosing regimen:
+
+- Dose amount: 100 mg
+- Dosing interval: 24 hours
+- Total doses: 5 (one loading + four additional)
+- Simulation horizon: 168 hours (one week)
+
+```{r baseline-sim}
+ev_baseline <- ev(amt = 100, ii = 24, addl = 4)
+
+out_baseline <- mod %>%
+  ev(ev_baseline) %>%
+  mrgsim(end = 168, delta = 0.1)
+
+head(as.data.frame(out_baseline))
+```
+
+## All compartments
+
+```{r baseline-plot, fig.cap="All state variables under the baseline regimen (100 mg Q24h × 5)."}
+plot(out_baseline)
+```
+
+**What I see:** `GUT` shows characteristic sawtooth behavior: each dose drops
+100 mg into the absorption depot, which then decays via first-order absorption
+into the central compartment. `CENT` and `CP` show the canonical approach
+toward steady state, with peaks gradually converging after approximately 3 to 4
+dosing intervals. `RESP` (the PD endpoint) shows a clear time lag relative to
+`CP`. The drug concentration does not act directly on the response; it
+modulates the response's production rate, and the response variable integrates
+that signal over its own timescale.
+
+**Engineering parallel.** The PK→PD lag here is mathematically the same
+phenomenon as capacitive damping in physical systems: the input drives the
+output, but the output has its own intrinsic time constant for accumulation and
+decay. Recognizing this structural similarity made the indirect-response model
+immediately intuitive.
+
+# Experiment 2: Dose-response exploration
+
+The natural next question is: if I change the dose, how does the system
+respond? Linearity in PK does not guarantee linearity in PD, and this
+experiment is designed to make that distinction visible.
+
+## Setup
+
+Four dose levels, same regimen otherwise:
+
+```{r dose-sweep-sim}
+doses <- c(50, 100, 200, 400)
+
+sim_results <- lapply(doses, function(d) {
+  ev_d <- ev(amt = d, ii = 24, addl = 4)
+  out  <- mrgsim(mod, events = ev_d, end = 168, delta = 0.1) %>%
+    as.data.frame()
+  out$dose <- d
+  out
+}) %>% bind_rows()
+
+sim_results$dose <- factor(sim_results$dose, levels = doses)
+```
+
+## PK: plasma concentration vs. time
+
+```{r pk-plot, fig.cap="Plasma concentration (CP) across four dose levels."}
+ggplot(sim_results, aes(x = time, y = CP, color = dose)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "PK: Plasma concentration vs. time, by dose",
+    x = "Time (hours)",
+    y = "Plasma concentration (CP)",
+    color = "Dose (mg)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The four CP curves scale approximately in proportion to dose:
+doubling the dose roughly doubles `Cmax` and the steady-state envelope, with
+`Tmax` and terminal slope unchanged. This is the signature of linear PK,
+where clearance and volume of distribution are independent of concentration
+and exposure scales proportionally with input.
+
+## PD: response vs. time
+
+```{r pd-plot, fig.cap="Response (RESP) across the same four dose levels."}
+ggplot(sim_results, aes(x = time, y = RESP, color = dose)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "PD: Response vs. time, by dose",
+    x = "Time (hours)",
+    y = "Response (RESP)",
+    color = "Dose (mg)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The PD curves do *not* scale proportionally. Moving from
+50 mg to 100 mg produces a substantial change in the depth of response
+suppression; moving from 200 mg to 400 mg produces a much smaller incremental
+change. The PD response saturates at higher doses, with additional drug
+yielding diminishing returns once the IC50-driven inhibition mechanism
+approaches its maximal effect.
+
+## Quantifying linearity: Cmax and Rmin across doses
+
+To move from visual impression to quantitative confirmation, I extract the
+maximum plasma concentration (`Cmax`) and minimum response (`Rmin`, i.e. the
+deepest point of suppression) at each dose level, and compare exposure ratios
+against dose ratios.
+
+```{r cmax-table}
+summary_table <- sim_results %>%
+  group_by(dose) %>%
+  summarise(
+    Cmax = max(CP),
+    Rmin = min(RESP),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Dose_ratio        = as.numeric(as.character(dose)) / 50,
+    Cmax_ratio        = round(Cmax / Cmax[dose == 50], 2),
+    Rmin_pct_of_50mg  = round(100 * Rmin / Rmin[dose == 50], 1)
+  )
+
+knitr::kable(
+  summary_table,
+  caption = "Cmax and Rmin across dose levels, normalized to the 50 mg arm. If PK is linear, Cmax_ratio should track Dose_ratio one-to-one.",
+  col.names = c("Dose (mg)", "Cmax", "Rmin",
+                "Dose ratio", "Cmax ratio", "Rmin (% of 50 mg)"),
+  digits = 3
+)
+```
+
+**What I see:** The `Cmax ratio` column tracks the `Dose ratio` column nearly
+one-to-one across the entire 50 to 400 mg range, quantitatively confirming
+that the PK is linear over this dose range. The qualitative impression from the
+PK plot becomes a numerical claim. The `Rmin (% of 50 mg)` column tells a
+different story: despite an 8-fold increase in dose (and exposure), the deepest
+response suppression decreases by a much smaller factor. This is the
+quantitative footprint of PD saturation, a numerical fingerprint of the
+IC50-driven mechanism that governs the response.
+
+Placing dose ratios and exposure ratios in the same table makes the statement
+"PK is linear, PD is not" a defensible observation grounded in the simulation
+output rather than a qualitative impression.
+
+## Why linear PK can produce nonlinear PD
+
+This is the key conceptual takeaway of this exercise. The PK is governed by
+linear ODEs (first-order absorption, first-order elimination), so the output
+is linear in the input. The PD, however, contains an IC50-driven inhibition
+term of the form:
+
+$$
+\text{Inhibition} = \frac{C_p}{IC_{50} + C_p}
+$$
+
+This is a saturating function of `CP`. When `CP` ≪ `IC50`, the inhibition is
+approximately linear in `CP`. When `CP` ≫ `IC50`, the inhibition asymptotes to
+its maximum and additional drug produces almost no additional effect.
+
+I can see how this behavior would matter in practice: a simple "more dose =
+more effect" heuristic would work in the low-dose regime but fail once the
+system enters the saturated regime, and identifying where that transition
+occurs seems like exactly the kind of question that requires a mechanistic
+model rather than empirical titration alone.
+
+# Summary
+
+```{r summary-table, echo=FALSE}
+summary_tbl <- data.frame(
+  Aspect = c(
+    "Multi-dose accumulation",
+    "PK linearity",
+    "PK to PD lag",
+    "PD nonlinearity",
+    "Workflow learned"
+  ),
+  Observation = c(
+    "CP approaches steady state after ~3-4 dosing intervals",
+    "CP scales proportionally with dose across 50-400 mg",
+    "RESP lags CP by several hours due to indirect-response structure",
+    "RESP saturates at high doses due to IC50-driven inhibition",
+    "house() -> ev() -> mrgsim() -> as.data.frame() -> ggplot"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(
+  summary_tbl,
+  caption = "Summary of observations from the house model exploration."
+)
+```
+
+# Reflection
+
+The experiment that taught me the most was the dose-response sweep in
+Experiment 2. Before running it, I had assumed that a system with linear PK
+would produce proportionally scaled PD, because the input to the PD equation
+is the concentration output from the linear PK. The simulation showed that
+this reasoning is incomplete: the IC50-driven inhibition term introduces
+saturation in the PD layer even when the PK layer remains perfectly linear.
+The nonlinearity does not require nonlinear PK; it lives in the coupling
+between the two layers.
+
+Three abstract PK/PD concepts became concrete through this exercise.
+Steady-state accumulation is just repeated impulse responses summed in time,
+directly analogous to repeated transient loading in mechanical systems. The
+PK→PD lag in indirect-response models is structurally identical to capacitive
+damping: the input drives the output, but the output integrates on its own
+timescale. And the coexistence of linear PK with nonlinear PD illustrates why
+the relationship between dose and effect can only be predicted, not assumed,
+and why a mechanistic model of the full dose-exposure-response chain matters.
+
+As a first exercise, this was a "guided listening" session: the model was
+largely opaque (I did not read its ODE code or inspect parameter values in
+detail), but the simulation workflow became familiar, and the basic
+phenomenology of coupled PK/PD systems started to make sense. The next
+projects will open the box.
+
+# Next steps
+
+This exercise covers the observation half of the mrgsolve workflow on a
+built-in model. The natural next steps in this learning sequence are:
+
+1. Work with the simplest pharmacologically meaningful PK structure (a
+   one-compartment oral model) and systematically perturb each parameter to
+   build intuition for how the concentration-time profile responds
+   (project `02_pk1`).
+2. Add a peripheral compartment and explore the two-compartment structure,
+   including the distribution phase and terminal half-life behavior
+   (project `03_pk2`).
+3. Reproduce a published population PK model with covariates and
+   inter-individual variability from the literature (project `04_pk3`).
+4. Apply Sobol-based global sensitivity analysis to identify driver
+   parameters, a method I used routinely in my PhD work on knee joint
+   poromechanics, here re-applied to a PK/PD context.
+
+# Session info
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
+
+# References
+
+- mrgsolve documentation and model library: <https://mrgsolve.org>
+- Dayneka, N. L., Garg, V., & Jusko, W. J. (1993). Comparison of four basic
+  models of indirect pharmacodynamic responses. *Journal of Pharmacokinetics
+  and Biopharmaceutics*, 21(4), 457–478.
+- Rowland, M., & Tozer, T. N. *Clinical Pharmacokinetics and Pharmacodynamics:
+  Concepts and Applications* (5th ed.), Chapters 1–8.
