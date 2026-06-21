@@ -1,0 +1,669 @@
+---
+title: "PK1: One-Compartment Oral PK Parameter Sensitivity Exploration"
+author: "Ruoqi Deng"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: readable
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi = 100
+)
+```
+
+# Background and goals
+
+The first project in this portfolio (`01_house_model/`) used `house()`, a
+prebuilt PK/PD model shipped with `mrgsolve`, to get a feel for how a
+multi-compartment system behaves under repeated dosing and how a PD endpoint
+responds nonlinearly to dose. That exercise was a *guided listening* session:
+the model was opaque, but the simulation workflow became familiar.
+
+This project goes one layer deeper. Rather than load a black-box model and
+observe it, here I work with the simplest pharmacologically meaningful
+structure: a **one-compartment model with first-order oral absorption and
+first-order elimination**, and systematically perturb each parameter to see
+how the concentration-time profile responds.
+
+The model is `pk1` from `mrgsolve`'s built-in model library, which has three
+parameters:
+
+- `KA` — first-order absorption rate constant (1/h)
+- `CL` — systemic clearance (L/h)
+- `V`  — volume of distribution (L)
+
+and two compartments:
+
+- `EV`   — extravascular depot (mg; the oral dose lands here)
+- `CENT` — central compartment (mg; the amount of drug in plasma + rapidly
+  equilibrating tissue)
+
+with one captured output:
+
+- `CP` — plasma concentration (mg/L), computed as `CENT / V`.
+
+## What this document does
+
+A baseline simulation followed by five experiments, each isolating the effect
+of a single change:
+
+1. **Baseline simulation** — single 100 mg dose, 48 h horizon.
+2. **Experiment 1: Double `KA`** — faster absorption.
+3. **Experiment 2: Double `CL`** — faster systemic clearance.
+4. **Experiment 3: Double `V`** — larger volume of distribution.
+   *My initial expectation here was wrong, and tracing through why is where
+   most of the value of this whole project sits.*
+5. **Experiment 4: Double the dose** — dose-proportional scaling under linear
+   PK.
+6. **Experiment 5: Multiple dosing (Q12h × 5)** — accumulation toward steady
+   state.
+
+# Model
+
+## Equations
+
+The one-compartment oral model is governed by two ODEs:
+
+$$
+\begin{aligned}
+\frac{dA_{EV}}{dt}   &= -K_A \cdot A_{EV} \\
+\frac{dA_{CENT}}{dt} &=  K_A \cdot A_{EV} - \frac{CL}{V} \cdot A_{CENT}
+\end{aligned}
+$$
+
+with plasma concentration
+
+$$
+CP(t) = \frac{A_{CENT}(t)}{V}.
+$$
+
+The elimination rate constant is $k_{el} = CL / V$, and the terminal
+half-life is $t_{1/2} = \ln(2) / k_{el}$.
+
+For the default parameters used below ($CL = 1$ L/h, $V = 20$ L), this gives
+$k_{el} = 0.05$ h$^{-1}$ and $t_{1/2} \approx 13.9$ h.
+
+## Setup
+
+```{r libraries}
+library(mrgsolve)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+Load the built-in `pk1` model:
+
+```{r load-model}
+mod <- modlib("pk1")
+mod
+```
+
+Check default parameter values:
+
+```{r default-params}
+param(mod)
+```
+
+Defaults: `CL = 1`, `V = 20`, `KA = 1`. Every experiment below changes
+exactly one of these (or the dose) and keeps the others fixed.
+
+## Helpers
+
+```{r helpers}
+# Run a single-dose simulation and return a tidy data frame
+run_single_dose <- function(model, dose = 100, end = 48, delta = 0.1) {
+  model %>%
+    ev(amt = dose) %>%
+    mrgsim(end = end, delta = delta) %>%
+    as.data.frame()
+}
+
+# Tag a simulation data frame with a scenario label for overlay plotting
+label_run <- function(df, label) {
+  df %>% mutate(scenario = label)
+}
+
+# Trapezoidal AUC from a concentration-time data frame
+auc_trap <- function(time, conc) {
+  sum(diff(time) * (head(conc, -1) + tail(conc, -1)) / 2)
+}
+```
+
+# Baseline simulation
+
+A single 100 mg oral dose, simulated over 48 hours.
+
+```{r baseline-sim}
+out_baseline <- run_single_dose(mod, dose = 100)
+head(out_baseline)
+```
+
+```{r baseline-plot, fig.cap="Figure 1. Baseline single-dose simulation. EV decays exponentially from 100 mg; CENT rises to a peak, then declines mono-exponentially; CP is just CENT scaled by 1/V."}
+plot(out_baseline)
+```
+
+**What I see:** `EV` (the extravascular depot) starts at 100 mg the instant
+the dose lands and decays mono-exponentially with rate `KA = 1` h$^{-1}$.
+`CENT` (amount in central compartment) rises as the drug is absorbed, reaches
+a peak when input rate equals elimination rate, and then declines. `CP`
+(plasma concentration) has exactly the same *shape* as `CENT`, scaled down by
+`V = 20`. That is the entire content of "plasma concentration is central
+amount divided by volume", but seeing the two curves side by side makes it
+concrete.
+
+This baseline is the reference profile against which every perturbation
+below is measured.
+
+### Semi-log view
+
+A semi-log plot of `CP` reveals the mono-exponential character of the
+terminal phase more clearly. This will matter for the next project
+(`03_pk2_two_compartment/`), where a second compartment introduces a visible
+change of slope on the semi-log plot.
+
+```{r baseline-semilog, fig.cap="Figure 2. Semi-log view of baseline CP. After the absorption phase, the curve becomes a straight line, the hallmark of single-exponential elimination."}
+ggplot(out_baseline %>% filter(CP > 0), aes(x = time, y = CP)) +
+  geom_line(linewidth = 0.8, color = "#2E5E8E") +
+  scale_y_log10() +
+  labs(
+    title = "Baseline CP — semi-log scale",
+    x = "Time (h)", y = "CP (mg/L, log scale)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** After the initial absorption phase (roughly 0–5 h), the
+semi-log curve is essentially a straight line. That linearity *is* the
+single-exponential terminal phase: $\log CP(t) = \log CP_0 - k_{el} \cdot t /
+\ln 10$. In a one-compartment model there is only one slope. When the next
+project introduces a peripheral compartment, the semi-log plot will show two
+distinct slopes, and the contrast with this single straight line will be the
+clearest way to see the distribution phase emerge.
+
+### AUC verification
+
+Under linear PK, total exposure is $AUC = Dose / CL$. For the baseline
+parameters (100 mg, CL = 1 L/h), this predicts $AUC = 100$ mg·h/L. A quick
+trapezoidal integration confirms that the simulation is consistent:
+
+```{r baseline-auc}
+auc_baseline <- auc_trap(out_baseline$time, out_baseline$CP)
+auc_theory   <- 100 / 1  # Dose / CL
+
+cat(sprintf("Simulated AUC: %.2f mg·h/L\n", auc_baseline))
+cat(sprintf("Analytical AUC (Dose/CL): %.1f mg·h/L\n", auc_theory))
+cat(sprintf("Ratio (simulated / analytical): %.4f\n", auc_baseline / auc_theory))
+```
+
+The ratio is close to 1 but not exact, because the simulation ends at 48 h
+rather than infinity, so some drug remains uncleared. With a half-life of
+~13.9 h, 48 h covers roughly 3.5 half-lives, so about 8–9% of the AUC
+remains in the tail. This is consistent: $2^{-48/13.9} \approx 0.09$.
+Extending the simulation horizon would bring the ratio closer to 1. What
+matters here is that the discrepancy has a known, quantitative explanation
+rather than being a modeling error.
+
+# Single-parameter perturbations
+
+For each experiment, I overlay the perturbed curve on the baseline so the
+shift is easy to read directly.
+
+## Experiment 1: Double `KA` (faster absorption)
+
+```{r exp1-ka}
+out_ka <- mod %>% param(KA = 2) %>% run_single_dose(dose = 100)
+
+sim_exp1 <- bind_rows(
+  label_run(out_baseline, "Baseline (KA = 1)"),
+  label_run(out_ka,        "KA doubled (KA = 2)")
+)
+```
+
+```{r exp1-plot, fig.cap="Figure 3. Doubling KA: absorption is faster, Tmax is earlier, Cmax is higher, but the terminal slope is unchanged."}
+ggplot(sim_exp1, aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Experiment 1: Effect of doubling KA on plasma concentration",
+    x = "Time (h)", y = "CP (mg/L)", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The `KA = 2` curve climbs faster, peaks earlier, and
+reaches a higher `Cmax` than baseline. The terminal descending portion of
+the two curves looks visually parallel, with the same slope.
+
+This matches the equations: `KA` does not appear in the elimination term
+`(CL/V)·CENT`, so it cannot change how fast the central compartment empties.
+It only controls the input rate from `EV` into `CENT`. So `KA` is purely an
+absorption-phase knob: it sets *when* and *how high* the peak is, but does
+not touch the terminal behavior. Nothing here contradicted the expectation:
+the result lined up with what I expected from the structure of the model.
+
+## Experiment 2: Double `CL` (faster elimination)
+
+```{r exp2-cl}
+out_cl <- mod %>% param(CL = 2) %>% run_single_dose(dose = 100)
+
+sim_exp2 <- bind_rows(
+  label_run(out_baseline, "Baseline (CL = 1)"),
+  label_run(out_cl,        "CL doubled (CL = 2)")
+)
+```
+
+```{r exp2-plot, fig.cap="Figure 4. Doubling CL: terminal slope steepens, Cmax falls, and the curve sits lower throughout."}
+ggplot(sim_exp2, aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Experiment 2: Effect of doubling CL on plasma concentration",
+    x = "Time (h)", y = "CP (mg/L)", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The `CL = 2` curve sits below baseline throughout, has a
+lower `Cmax`, and descends more steeply on the terminal phase. With
+$k_{el} = CL/V$, doubling `CL` doubles the elimination rate constant
+(from 0.05 to 0.1 h$^{-1}$), halving the terminal half-life from roughly
+13.9 h to 6.9 h. The drop in `Cmax` makes sense too: even during the
+absorption phase, drug is being cleared faster, so the central compartment
+doesn't get the chance to accumulate as much before input and output balance.
+
+Under linear PK, total exposure is $AUC = Dose / CL$, so doubling `CL`
+halves AUC. I can see how this makes `CL` central to clinical dosing
+questions: at a fixed dosing rate, it directly determines how much drug
+a patient is actually exposed to.
+
+### AUC check: CL doubled
+
+```{r exp2-auc}
+auc_cl2 <- auc_trap(out_cl$time, out_cl$CP)
+cat(sprintf("Simulated AUC (CL = 2): %.2f mg·h/L\n", auc_cl2))
+cat(sprintf("Analytical AUC (Dose/CL): %.1f mg·h/L\n", 100 / 2))
+cat(sprintf("AUC ratio (CL=2 / baseline): %.3f\n", auc_cl2 / auc_baseline))
+```
+
+With the faster clearance, 48 h covers about 7 half-lives, so almost all of
+the AUC is captured. The simulated ratio of AUC(CL=2) to AUC(baseline) is
+close to 0.5, consistent with the Dose/CL relationship. The ratio is
+slightly above 0.5 because the baseline simulation truncates more tail area
+(only 3.5 half-lives) than the CL=2 simulation (7 half-lives).
+
+## Experiment 3: Double `V` (larger volume of distribution)
+
+This is the experiment where my initial intuition turned out to be wrong,
+and the process of figuring out *why* it was wrong is the most useful thing
+I got out of this whole project.
+
+```{r exp3-v}
+out_v <- mod %>% param(V = 40) %>% run_single_dose(dose = 100)
+
+sim_exp3 <- bind_rows(
+  label_run(out_baseline, "Baseline (V = 20)"),
+  label_run(out_v,         "V doubled (V = 40)")
+)
+```
+
+### What I expected vs. what the simulation showed
+
+Before running this experiment, my expectation was straightforward and,
+as it turned out, wrong. The reasoning went: `V` appears in the
+denominator of `CP = CENT/V`, so doubling `V` should *dilute* the drug and
+push concentration down. I expected both `CENT` and `CP` to come out lower
+than baseline, with the only question being by how much.
+
+That is not what the simulation produced. The output showed `CP`'s peak
+dropping (as expected) but `CENT`'s peak *rising*. The two state variables
+were moving in opposite directions in response to the same parameter change.
+
+My first reaction was to suspect a mistake: either in how I had set up the
+simulation or in how I was reading the output. So I went back, re-ran the
+baseline and the V-doubled cases side by side, looked at the raw numeric
+output, and confirmed: `CENT` really was higher. The simulation was telling
+me something about the model that my verbal reasoning had not picked up on.
+
+### Confirming the observation
+
+```{r exp3-plot, fig.cap="Figure 5. Doubling V shifts CENT (amount in central compartment) UP, but shifts CP (plasma concentration) DOWN. Same simulation, two perspectives.", fig.height=6}
+sim_exp3_long <- sim_exp3 %>%
+  select(time, scenario, CENT, CP) %>%
+  pivot_longer(cols = c(CENT, CP), names_to = "variable", values_to = "value")
+
+ggplot(sim_exp3_long, aes(x = time, y = value, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1,
+             labeller = as_labeller(c(
+               CENT = "CENT — amount in central compartment (mg)",
+               CP   = "CP — plasma concentration (mg/L)"
+             ))) +
+  labs(
+    title = "Experiment 3: Doubling V — opposite effects on CENT and CP",
+    x = "Time (h)", y = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r exp3-summary}
+summary_exp3 <- sim_exp3 %>%
+  group_by(scenario) %>%
+  summarise(
+    Cmax_CENT = max(CENT),
+    tmax_CENT = time[which.max(CENT)],
+    Cmax_CP   = max(CP),
+    tmax_CP   = time[which.max(CP)],
+    .groups = "drop"
+  )
+
+knitr::kable(
+  summary_exp3,
+  digits = 3,
+  caption = "Table 1. Peak amount in central compartment vs. peak plasma concentration, baseline vs. V doubled."
+)
+```
+
+The numbers confirm what the plot shows. With the observation locked in,
+the next step was to go back to the equations and figure out why my verbal
+reasoning had been incomplete.
+
+### Tracing the mechanism back through the ODE
+
+Starting from the central compartment equation:
+
+$$
+\frac{dA_{CENT}}{dt} = K_A \cdot A_{EV} - \frac{CL}{V} \cdot A_{CENT}
+$$
+
+The peak of `CENT` occurs at the moment when input rate equals elimination
+rate:
+
+$$
+K_A \cdot A_{EV}(T_{max}) = \frac{CL}{V} \cdot A_{CENT}(T_{max})
+$$
+
+Solving for `CENT` at the peak:
+
+$$
+A_{CENT}(T_{max}) = K_A \cdot A_{EV}(T_{max}) \cdot \frac{V}{CL}
+$$
+
+**`V` appears in the numerator here.** That is the piece my initial
+intuition missed. I had been thinking of `V` only as a denominator (because
+that is how it appears in `CP = CENT/V`), but in the differential equation
+for `CENT`, `V` enters through the elimination term `(CL/V)·CENT`. Larger
+`V` means slower per-mass elimination, which means `CENT` accumulates
+further before input and elimination balance.
+
+Concretely:
+
+- **Baseline:** $V = 20$, $k_{el} = CL/V = 0.05$ h$^{-1}$.
+- **V doubled:** $V = 40$, $k_{el} = 0.025$ h$^{-1}$. Elimination is half
+  as fast, so the central compartment accumulates more drug before
+  reaching its peak. **`CENT` rises.**
+
+For `CP`, the picture is the opposite. `CENT` rose slightly because the larger
+`V` reduced the elimination rate constant (`CL/V`), allowing more drug amount
+to remain in the central compartment. However, this increase in `CENT` was much
+smaller than the two-fold increase in `V`. Therefore, after dividing by the
+larger volume, `CP = CENT / V` decreased substantially.
+
+The doubling of `V` wins out over the partial rise in `CENT`, and **`CP`
+falls** by roughly 25–30%.
+
+### The thing I should have spotted
+
+`V` does three things in this model, not one:
+
+```{r v-roles-table, echo=FALSE}
+v_roles <- data.frame(
+  Pathway = c("Elimination rate",
+              "Amount-to-concentration conversion",
+              "Terminal half-life"),
+  `Where V appears` = c("k_el = CL/V (V in denominator)",
+                         "CP = CENT/V (V in denominator)",
+                         "t_1/2 = ln2 · V / CL"),
+  `Effect when V doubles` = c("k_el halves → slower clearance → CENT ↑",
+                               "CENT divided by larger V → CP ↓",
+                               "t_1/2 doubles → tail extended"),
+  check.names = FALSE
+)
+
+knitr::kable(
+  v_roles,
+  caption = "Three roles of V in the one-compartment model."
+)
+```
+
+The two effects on the peak (pathway 1 pushing `CENT` and therefore `CP` up,
+pathway 2 pulling `CP` down) partially cancel. Whichever wins depends on the
+specific values. For these parameters, the dilution effect wins for `CP`.
+For `CENT`, only pathway 1 applies, because there is no dilution term for
+the state variable itself, so `CENT` rises cleanly.
+
+What I took away from this:
+
+- A parameter in a denominator of a converted variable (here, `CP`) is not
+  the same as a parameter in a denominator inside the dynamics (here, the
+  elimination rate). My initial "V is in the denominator → concentration
+  goes down" collapsed those two roles together.
+- The simulation caught a mistake my verbal reasoning could not. If I had
+  trusted my expectation and not re-checked the numeric output, I would
+  have written down a wrong conclusion. The discipline of letting the
+  simulation contradict you, then going back to the equations to figure
+  out why, is the actual work.
+
+**Engineering parallel.** This is structurally the same situation I dealt
+with in finite element modeling: a single material parameter (e.g. tissue
+permeability) appearing in both a constitutive term and an effective
+boundary condition, with the two contributions partially cancelling. In
+both cases the lesson is the same: you cannot read the effect of a
+parameter off a single occurrence in a single equation; you have to look at
+where it shows up across the whole system.
+
+## Experiment 4: Double the dose (dose-proportional scaling)
+
+```{r exp4-dose}
+out_dose200 <- run_single_dose(mod, dose = 200)
+
+sim_exp4 <- bind_rows(
+  label_run(out_baseline,  "Dose = 100 mg"),
+  label_run(out_dose200,   "Dose = 200 mg")
+)
+```
+
+```{r exp4-plot, fig.cap="Figure 6. Doubling the dose doubles every point of the CP curve, while Tmax and terminal slope are unchanged."}
+ggplot(sim_exp4, aes(x = time, y = CP, color = scenario)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Experiment 4: Effect of doubling dose on plasma concentration",
+    x = "Time (h)", y = "CP (mg/L)", color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** The 200 mg curve traces exactly the same shape as the
+100 mg curve, just scaled up: same `Tmax`, same terminal slope, roughly
+twice the `Cmax`. Doubling the dose doubles every point of the curve.
+
+This is what linear PK does. Because `CL` and `V` do not depend on
+concentration in this model, the entire system is linear in the input, and
+exposure scales proportionally. I can see how this linearity is what makes
+simple dose adjustments by ratio possible in clinical settings.
+
+After the V experiment, this one was a useful check in the opposite
+direction: sometimes the simple intuition really is correct, and the
+system behaves the way you'd predict from one line of algebra. The trick
+is knowing in advance which case you're in, which is exactly what running
+the simulation tells you.
+
+I've read that dose proportionality is one of the first things to break for
+more complex drugs. Target-mediated drug disposition (TMDD) is one example:
+at low doses, target binding dominates clearance; at high doses, the target
+saturates and the drug behaves more linearly. I haven't modeled that here,
+but it seems like the kind of non-proportionality that would show up
+immediately on a plot like this one, where the curves would no longer be
+scalar multiples of each other.
+
+## Experiment 5: Multiple dosing, accumulation toward steady state
+
+```{r exp5-multi}
+out_multi <- mod %>%
+  ev(amt = 100, ii = 12, addl = 4) %>%
+  mrgsim(end = 96, delta = 0.1) %>%
+  as.data.frame()
+```
+
+```{r exp5-plot, fig.cap="Figure 7. Q12h × 5 dosing. Each new dose lands before the previous one has been fully cleared, so concentration accumulates and converges toward a steady-state envelope."}
+ggplot(out_multi, aes(x = time, y = CP)) +
+  geom_line(linewidth = 0.8, color = "#2E5E8E") +
+  geom_vline(xintercept = c(0, 12, 24, 36, 48), linetype = "dashed",
+             color = "grey60", linewidth = 0.3) +
+  labs(
+    title = "Experiment 5: Multiple oral dosing (100 mg Q12h × 5)",
+    x = "Time (h)", y = "CP (mg/L)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**What I see:** Five oscillations stacked on top of each other, each one
+sitting at a slightly higher level than the last, with the gap between
+successive peaks shrinking each time. By the fourth and fifth dose, the
+peak-to-trough envelope has roughly stabilized. Successive doses are now
+adding roughly as much as the previous interval cleared.
+
+The reason concentration accumulates rather than returning to zero between
+doses is that the dosing interval (12 h) is shorter than the terminal
+half-life (~13.9 h at baseline parameters). Substantial drug from the
+previous dose is still present when the next one lands.
+
+### Steady-state quantification
+
+The theoretical accumulation factor for a one-compartment model under
+repeated dosing is $R = 1 / (1 - e^{-k_{el} \cdot \tau})$, where $\tau$ is
+the dosing interval. For these parameters:
+
+```{r exp5-accumulation}
+kel <- 1 / 20      # CL / V
+tau <- 12           # dosing interval (h)
+R_theory <- 1 / (1 - exp(-kel * tau))
+
+cat(sprintf("kel = %.3f h^-1\n", kel))
+cat(sprintf("tau = %d h\n", tau))
+cat(sprintf("Theoretical accumulation factor R = %.3f\n", R_theory))
+```
+
+```{r exp5-ss-summary}
+# Approximate Cmax and Cmin from the last dosing interval (dose 5: 48-60 h)
+ss_interval <- out_multi %>% filter(time >= 48, time <= 60)
+Cmax_ss <- max(ss_interval$CP)
+Cmin_ss <- min(ss_interval$CP)
+
+# Compare to single-dose Cmax
+Cmax_single <- max(out_baseline$CP)
+
+cat(sprintf("Single-dose Cmax: %.3f mg/L\n", Cmax_single))
+cat(sprintf("Steady-state Cmax: %.3f mg/L\n", Cmax_ss))
+cat(sprintf("Observed accumulation ratio (Cmax_ss / Cmax_single): %.3f\n",
+            Cmax_ss / Cmax_single))
+cat(sprintf("Cmin_ss: %.3f mg/L\n", Cmin_ss))
+cat(sprintf("Peak-to-trough ratio (Cmax/Cmin): %.2f\n", Cmax_ss / Cmin_ss))
+```
+
+The observed accumulation ratio is somewhat below the theoretical $R$,
+which makes sense: five doses is close to but not yet at true steady state,
+and the theoretical formula assumes instantaneous dosing into the central
+compartment whereas oral absorption spreads the input over time. What the
+numbers do confirm is that accumulation is modest (roughly 2-fold), a
+direct consequence of the dosing interval being close to one half-life.
+
+**Engineering parallel.** This is the closest connection in the project to
+the kind of transient analysis I'm used to from engineering: a linear
+system driven by a periodic sequence of impulses, with the response
+building up until the rate of input matches the rate of clearance averaged
+over a dosing interval. The math is the same; what changes is what the
+impulses physically are.
+
+# Summary: parameter influence matrix
+
+A condensed reference for what each parameter controls in this model:
+
+```{r summary-table, echo=FALSE}
+summary_tbl <- data.frame(
+  Parameter = c("KA", "CL", "V", "Dose"),
+  `Absorption phase`   = c("Steeper / earlier Tmax", "Unchanged", "Unchanged", "Unchanged shape, scaled height"),
+  `Cmax (CP)`          = c("Higher", "Lower", "Lower",  "Proportionally higher"),
+  `Terminal slope`     = c("Unchanged", "Steeper (shorter t1/2)", "Shallower (longer t1/2)", "Unchanged"),
+  `AUC (CP)`           = c("Unchanged",  "Lower (~halved)", "Unchanged",  "Proportionally higher"),
+  check.names = FALSE
+)
+
+knitr::kable(
+  summary_tbl,
+  caption = "Table 2. How each perturbation shifts the major features of the CP curve.
+For linear PK, AUC∞ is Dose/CL and is independent of V and KA. Finite-window
+AUC values such as AUC0–48h can still differ when the terminal tail becomes
+longer or shorter."
+)
+```
+
+A few patterns worth noting. `KA` is the only parameter that changes `Tmax` without changing the terminal slope; it is purely an absorption-phase knob. `CL` is the only parameter that changes theoretical AUC∞ under this linear
+model. Other parameters may change the shape of the curve and the finite-window
+AUC captured within a specific simulation horizon, especially when they change
+the terminal half-life. `V` changes the terminal slope and `Cmax` in opposite directions, because it appears in both $k_{el} = CL/V$ and $CP = CENT/V$. And dose scales the whole curve linearly under the linear PK assumption. When that assumption breaks (saturable elimination, capacity-limited processes), dose proportionality is the first thing to fail, and I expect that detecting that departure would be an important diagnostic in early-phase PK analysis.
+
+# Reflection
+
+The single most useful thing this project gave me was the experience of
+being confidently wrong about Experiment 3 and then having the simulation
+contradict me.
+
+I had a clean verbal story going in: `V` is in the denominator of
+`CP = CENT/V`, so doubling `V` should bring concentration down. Both `CENT`
+and `CP` should drop. That story was wrong about `CENT`, not because the
+math was hard, but because I had collapsed two distinct roles of `V` into a
+single mental shortcut. Once the plot showed `CENT` going up, I had to put
+the verbal story aside and re-derive the mechanism from the ODE. The result
+clicked in a way that no amount of reading would have produced, because the
+mistake was mine and the correction was mine.
+
+The pattern I want to carry forward into the next projects is something
+like: state a prediction before running each simulation, even a rough one;
+when the simulation disagrees, treat the disagreement as the most
+informative output of the run, not as a problem to be smoothed over.
+
+The thing that surprised me on the meta level was how much the
+intuition-building loop in `mrgsolve` resembled my PhD workflow. In finite
+element modeling I would routinely run a baseline simulation, perturb one
+material parameter or one boundary condition, and look at how the field
+variables shifted, sometimes confirming an expectation, sometimes
+revealing a coupling I hadn't appreciated. The workflow here is the same;
+only the variable names and the physical units differ. That continuity is
+the main reason I think the transition from biomechanics to pharmacometrics
+is more about vocabulary than about quantitative skill.
+
+# Next steps
+
+The next project in this portfolio (`03_pk2_two_compartment/`) will move
+from one compartment to two, introducing a peripheral compartment connected
+by inter-compartmental clearance `Q`. The new phenomenon there is the
+**distribution phase**: a fast initial decline followed by a slower terminal
+decline, visible as a clear change in slope on the semi-log plot, in
+contrast to the single straight line seen in this project's semi-log view.
+
+After that, `04_pk3_published_model/` will step away from built-in models
+and work through a published PopPK model from the literature, with
+covariate effects and inter-individual variability. That is where the
+portfolio moves from learning how individual parameters shape curves to
+seeing how variability across a population is handled in practice.
