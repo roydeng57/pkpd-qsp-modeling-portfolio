@@ -25,8 +25,8 @@ to be read as a learning journal, not a finished product.
 
 | Project | Focus | Status |
 |---|---|---|
-| [`01_house_model/`](01_house_model/) | First hands-on exploration of `mrgsolve` using the built-in `house()` PK/PD model. Multi-dose simulation, dose-response, and quantitative confirmation of linear PK vs. nonlinear PD. | Complete |
-| [`02_pk1_oral_one_compartment/`](02_pk1_oral_one_compartment/) | Building a one-compartment oral PK model from scratch using `$PARAM` / `$CMT` / `$ODE`. Parameter sensitivity experiments (KA, CL, V, dose, multiple dosing) and reproduction of textbook results. | In progress |
+| [`01_mrgsolve_house_model/`](01_mrgsolve_house_model/) | First hands-on exploration of `mrgsolve` using the built-in `house()` PK/PD model. Multi-dose simulation, dose-response, and quantitative confirmation of linear PK vs. nonlinear PD. | Complete |
+| [`02_one_compartment_pk/`](02_one_compartment_pk/) | Building a one-compartment oral PK model from scratch using `$PARAM` / `$CMT` / `$ODE`. Parameter sensitivity experiments (KA, CL, V, dose, multiple dosing) and reproduction of textbook results. | In progress |
 | `03_pk2_two_compartment/` | Planned next: two-compartment PK model with distribution phase. | Planned |
 
 ---
