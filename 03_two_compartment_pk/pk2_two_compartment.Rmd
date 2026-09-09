@@ -281,11 +281,14 @@ sim_exp1 %>%
 ```
 
 **What I see:** The Q = 4 curve sits only slightly below baseline at the peak:
-Cmax drops by a small amount, while Tmax is virtually unchanged. This is
-expected because the peak occurs early (~2-3 h), when the peripheral
-compartment is still nearly empty. Both Q-dependent terms in the
-central-compartment equation scale with A_PERIPH, which is close to zero at
-that point, so doubling Q has little leverage on Cmax.
+Cmax decreases modestly, while Tmax is nearly unchanged. Early after dosing,
+the peripheral compartment still contains relatively little drug, so the
+return flux (Q/V3) · A_PERIPH is small, whereas the outward flux
+(Q/V2) · A_CENT is already active. Increasing Q therefore increases the net
+transfer from central to peripheral during this early phase, producing a
+slightly lower central concentration. The effect on Tmax remains small under
+this parameter set because the timing of the peak is still strongly influenced
+by the absorption process.
 
 The more visible effect is on the distribution phase. On the semi-log plot,
 the transition from the steep initial decline to the shallower terminal
