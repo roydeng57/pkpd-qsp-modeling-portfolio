@@ -539,8 +539,8 @@ ggplot(out_multi, aes(x = time, y = CP)) +
 
 **What I see:** Five oscillations stacked on top of each other, each one
 sitting at a slightly higher level than the last, with the gap between
-successive peaks shrinking each time. By the fourth and fifth dose, the
-peak-to-trough envelope has roughly stabilized. Successive doses are now
+successive peaks shrinking each time. By the fourth and fifth dose, the changes between successive peak-to-trough intervals have become smaller, although true steady state has not been established. 
+Successive doses are now
 adding roughly as much as the previous interval cleared.
 
 The reason concentration accumulates rather than returning to zero between
@@ -548,45 +548,28 @@ doses is that the dosing interval (12 h) is shorter than the terminal
 half-life (~13.9 h at baseline parameters). Substantial drug from the
 previous dose is still present when the next one lands.
 
-### Steady-state quantification
+### Accumulation after five doses
 
-The theoretical accumulation factor for a one-compartment model under
-repeated dosing is $R = 1 / (1 - e^{-k_{el} \cdot \tau})$, where $\tau$ is
-the dosing interval. For these parameters:
+```r
+```{r exp5-last-interval}
+# Summarize the final observed dosing interval (dose 5: 48-60 h)
 
-```{r exp5-accumulation}
-kel <- 1 / 20      # CL / V
-tau <- 12           # dosing interval (h)
-R_theory <- 1 / (1 - exp(-kel * tau))
+last_interval <- out_multi %>% filter(time >= 48, time <= 60)
 
-cat(sprintf("kel = %.3f h^-1\n", kel))
-cat(sprintf("tau = %d h\n", tau))
-cat(sprintf("Theoretical accumulation factor R = %.3f\n", R_theory))
-```
+Cmax_last <- max(last_interval$CP)
+Cmin_last <- min(last_interval$CP)
 
-```{r exp5-ss-summary}
-# Approximate Cmax and Cmin from the last dosing interval (dose 5: 48-60 h)
-ss_interval <- out_multi %>% filter(time >= 48, time <= 60)
-Cmax_ss <- max(ss_interval$CP)
-Cmin_ss <- min(ss_interval$CP)
-
-# Compare to single-dose Cmax
 Cmax_single <- max(out_baseline$CP)
 
 cat(sprintf("Single-dose Cmax: %.3f mg/L\n", Cmax_single))
-cat(sprintf("Steady-state Cmax: %.3f mg/L\n", Cmax_ss))
-cat(sprintf("Observed accumulation ratio (Cmax_ss / Cmax_single): %.3f\n",
-            Cmax_ss / Cmax_single))
-cat(sprintf("Cmin_ss: %.3f mg/L\n", Cmin_ss))
-cat(sprintf("Peak-to-trough ratio (Cmax/Cmin): %.2f\n", Cmax_ss / Cmin_ss))
+cat(sprintf("Final-interval Cmax: %.3f mg/L\n", Cmax_last))
+cat(sprintf("Observed Cmax accumulation ratio: %.3f\n",
+            Cmax_last / Cmax_single))
+cat(sprintf("Final-interval Cmin: %.3f mg/L\n", Cmin_last))
+cat(sprintf("Peak-to-trough ratio: %.2f\n", Cmax_last / Cmin_last))
 ```
 
-The observed accumulation ratio is somewhat below the theoretical $R$,
-which makes sense: five doses is close to but not yet at true steady state,
-and the theoretical formula assumes instantaneous dosing into the central
-compartment whereas oral absorption spreads the input over time. What the
-numbers do confirm is that accumulation is modest (roughly 2-fold), a
-direct consequence of the dosing interval being close to one half-life.
+After five Q12h doses, the concentration profile shows clear accumulation. Because the system has not been demonstrated to have reached true steady state, I use the final observed dosing interval only to describe finite-dose accumulation and peak-to-trough behavior. The increasing concentrations are expected because the 12 h dosing interval is shorter than the approximately 13.9 h elimination half-life, so a substantial amount of drug remains when the next dose is administered.
 
 **Engineering parallel.** This is the closest connection in the project to
 the kind of transient analysis I'm used to from engineering: a linear
