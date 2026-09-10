@@ -348,8 +348,10 @@ return term (Q/V3) · A_PERIPH. It does not appear in the definition
 CP = A_CENT / V2. Therefore, its influence on plasma concentration is entirely
 indirect, mediated through drug redistribution. Doubling V3 halves Q/V3,
 which slows the return of drug from the peripheral compartment to the central
-compartment. This single kinetic change has opposite consequences depending
-on which phase of the profile dominates.
+compartment. Increasing V3 reduces Q/V3 and changes the distribution dynamics 
+bertween the central and peripheral compartments. The resulting crossover 
+reflects the behavior of the coupled two-compartment system rather than a 
+single isolated effect.
 
 During the distribution phase, the net flow is from central to peripheral
 compartment. Slowing the return flux reduces the compensating back-flow,
@@ -507,7 +509,8 @@ sim_exp4 <- bind_rows(
 )
 ```
 
-```{r exp4-plot, fig.cap="Figure 7. Q -> infinity on semi-log scale. The distribution-phase kink disappears; the terminal slope matches baseline."}
+```{r exp4-plot, fig.cap="Figure 7. Q -> infinity on semi-log scale. The distribution-phase kink
+disappears and the terminal slope approaches the rapid-equilibrium limit."}
 sim_exp4 %>%
   filter(CP > 0) %>%
   ggplot(aes(x = time, y = CP, color = scenario)) +
@@ -531,13 +534,13 @@ absorption or elimination, the distribution phase collapses into an
 imperceptibly short interval. The plasma concentration enters a single
 log-linear decline immediately after Cmax.
 
-Despite the dramatically different early behavior, both scenarios ultimately
-converge to the same terminal slope: once the baseline curve also reaches
-quasi-equilibrium, both systems behave as a single well-mixed pool with
-effective volume V2 + V3. Q mainly determines how fast the system reaches
-the terminal phase. In the rapid-equilibrium approximation, the terminal
-phase is governed mostly by the effective volume and clearance, although the
-exact hybrid terminal slope can still change slightly with Q.
+Despite the dramatically different early behavior, the late slopes are 
+similar but not exactly identical. In a finite-Q two-compartment model, 
+the terminal rate is a hybrid eigenvalue that depends on CL, V2, V3, and Q. 
+As Q becomes very large, inter-compartmental equilibrium becomes much faster 
+than elimination, and the system approaches the rapid-equilibrium limit. 
+In that limit, the terminal behavior approaches that of a well-mixed system 
+with effect volume V2 + V3, giving beta approximately CL / (V2 + V3). 
 
 Putting both extremes of `Q` on one plot shows the full picture: `Q` is a slider
 between a fully separated two-compartment system and a single well-mixed volume.
@@ -650,7 +653,7 @@ ggplot(sim_exp6, aes(x = time, y = CP, color = model)) +
   theme_minimal(base_size = 12)
 ```
 
-### Cmax / Cmin at steady state
+### Cmax / Cmin during the final dosing interval
 
 ```{r exp6-summary}
 last_dose_time <- 48
@@ -682,8 +685,8 @@ sim_exp6 %>%
   )
 ```
 The summary was calculated over the last dosing interval from 48 to 60 h,
-rather than over the entire post-dose tail. This avoids treating the washout
-phase as part of the steady-state trough calculation.
+rather than over the entire post-dose tail. This keeps the comparison focused 
+on peak-to-trough behavior during the final observed dosing interval.
 
 **What I see:** Compared with pk1, pk2 exhibits slightly smaller
 peak-to-trough fluctuation within each dosing interval. Distribution into the
