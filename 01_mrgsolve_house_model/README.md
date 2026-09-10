@@ -30,19 +30,19 @@ at higher doses due to the IC50-driven inhibition mechanism. The
 exposure–response summary table in Section 4.4 of the report quantifies this
 gap. This was the first concrete example I encountered of linear PK coexisting
 with nonlinear PD, and it motivated the parameter-level exploration that
-follows in `02_pk1` and `03_pk2`.
+follows in `02_one_compartment_pk` and `03_two_compartment_pk`.
 
 ## What this project is not
 
 Not a parameter sensitivity study: I run multiple dose levels but do not
 isolate individual PK or PD parameters. That one-parameter-at-a-time
-exploration begins in `02_pk1`. The PD side (indirect-response mechanism,
+exploration begins in `02_one_compartment_pk`. The PD side (indirect-response mechanism,
 IC50, Imax) is observed here but not dissected; this project is about
 getting comfortable with the simulation workflow before going deeper.
 
 ## Next in the portfolio
 
-`02_pk1/` strips the model down to a one-compartment oral PK system and
+`02_one_compartment_pk/` strips the model down to a one-compartment oral PK system and
 walks through each parameter one at a time: KA, CL, V, dose, and
 multi-dose accumulation. That is where the "what does each parameter
 actually do to the curve" question gets answered.
