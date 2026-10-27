@@ -6,7 +6,7 @@ to fully understand.
 
 ## What this project covers
 
-- Loading and inspecting a pre-built `mrgsolve` model (two-compartment PK with
+- Loading and inspecting the built-in `mrgsolve` model (one-compartment oral PK with
   indirect-response PD)
 - Constructing dosing events and running multi-dose simulations
 - Visualizing coupled PK/PD output (`GUT`, `CENT`, `CP`, `RESP`)
