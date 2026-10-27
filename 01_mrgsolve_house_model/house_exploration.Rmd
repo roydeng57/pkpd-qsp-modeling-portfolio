@@ -69,8 +69,7 @@ models.
 Two simulation experiments, layered:
 
 1. **Baseline simulation** — a single dose level (100 mg Q24h × 5) to observe
-   the four state variables (`GUT`, `CENT`, `CP`, `RESP`) over a one-week
-   window.
+   the three state variables (`GUT`, `CENT`, `RESP`) and the calculated plasma concentration (CP).
 2. **Dose-response exploration** — four dose levels (50, 100, 200, 400 mg) on
    the same regimen, plotted separately for PK and PD to expose the
    nonlinearity introduced by the IC50-driven response.
